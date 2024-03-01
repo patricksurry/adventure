@@ -1,7 +1,8 @@
 import struct
 import json
+import re
 from itertools import accumulate
-from dizzy import dizzy, undizzy, dizzy_squeeze
+from dizzy import dizzy, undizzy, dizzy_squeeze, woozy, unwoozy, unwrap
 
 
 def compact_word(word: str, lo: int, hi: int):
@@ -15,9 +16,18 @@ def compact_word(word: str, lo: int, hi: int):
     return struct.pack("<BBB", lo, hi, len(word)) + word.encode('ascii')
 
 
-def compact_cave(long: bytes, short: bytes, travel: list[int]):
+def compact_cave(long: bytes, short: bytes, travel: list[tuple[int,int,int,int,int]]):
     """
     compact representation for cave data
+    the tuple looks like (dtyp, dest, verb, cflg, cobj) <= (2, 161, 307, 7, 95)
+    so in bits dtyp:2, dest:8, verb:9, cflg:3, cobj:7 = 2+8+9+3+7 = 29
+    which we represent in a uint32 as
+
+    +-----------------+-----------------+-----------------+-----------------+
+    | 7 6 5 4 3 2 1 0 | 7 6 5 4 3 2 1 0 | 7 6 5 4 3 2 1 0 | 7 6 5 4 3 2 1 0 |
+    +------+-----+----+-----------------+--------------+--+-----------------+
+    | . . .|  cf | dt |     dest        |     cobj     |          verb      |
+    +------+-----+----+-----------------+--------------+--+-----------------+
 
     byte 0: offset to long (or 0 if none)
     byte 1: # travel
@@ -25,40 +35,58 @@ def compact_cave(long: bytes, short: bytes, travel: list[int]):
     @short: strz
     [@long: strz]
     """
+    dvcs = [
+        v | (c << 9) | (d << 16) | (dt << 24) | (cf << 26)
+        for (dt, d, v, cf, c) in travel
+    ]
+
     if long == short:
         offset = 0
     else:
-        offset = 2 + 4 * len(travel) + len(short) + 1
+        offset = 2 + 4 * len(dvcs) + len(short)
         assert offset < 256
 
-    data = struct.pack(f"<BB{len(travel)}I", offset, len(travel), *travel)
+    data = struct.pack(f"<BB{len(dvcs)}I", offset, len(dvcs), *dvcs)
     data += short
     if offset:
         data += long
     return data
 
-
 # fetch the extracted data
 advent = json.load(open('data/advent.json'))
 
 caves = advent['caves']
+
+# was 27176
+for c in caves:
+    s = c['long']
+    c['long'] = unwrap(c['long'])
+    c['short'] = unwrap(c['short'])
+
 corpus = (
     [c['long'] for c in caves]
     + [c['short'] for c in caves if c['short'] != c['long']]
     + advent['messages']
     + sum(advent['items'], [])
 )
-print('corpus has', len(corpus), 'strings', len(''.join(corpus)), 'characters')
 
 # make a digram lookup table
-source = b'\0'.join(line.encode('ascii') for line in corpus)+b'\0'
-data, digrams = dizzy(source)
+source = unwrap('\0'.join(corpus)+'\0')
+print('corpus has', len(corpus), 'strings', len(source), 'total characters as strz')
+open('scripts/corpus.asc', 'w').write(source)
+data, digrams = dizzy(woozy(source))
 
 print(f"dizzy compress {len(source)} source bytes to {len(data)} compressed bytes "
-    f"with {len(digrams)} digrams. uncompress ok? {undizzy(data, digrams) == source}")
+    f"with {len(digrams)} digrams. uncompress ok? {unwoozy(undizzy(data, digrams)) == source}")
 
+max_sqz = (0,0)
 def sqz(s):
-    return dizzy_squeeze(s.encode('ascii'), digrams) + bytes([0])
+    global max_sqz
+    z = dizzy_squeeze(woozy(unwrap(s)), digrams) + b'\0'
+    ns = (len(s) + len(z), len(s))
+    if ns > max_sqz:
+        max_sqz = ns
+    return z
 
 """
 print(', '.join(f'${x:02x},${y:02x}' for x,y in d.values()))
@@ -66,35 +94,53 @@ print(', '.join(f'${x:02x}' for x in z.split(b'\0')[0]))
 print(src.split(b'\0')[0].decode('ascii'))
 """
 
-n = 0
+def pack_index(zs: list[bytes]) -> bytes:
+    offsets = list(accumulate((len(z) for z in zs), initial=0))[:-1]
+    idx = struct.pack(f"<{len(offsets)}H", *offsets)
+    assert len(offsets) == len(zs)
+    return idx
+
+# digrams
+print(f"??? constant ADVDAT")
+data = b''.join(digrams.values())
+bin = data
+print(f"ADVDAT $0000 + constant DIGRAMS \\ {len(data)} bytes")
+
 # words
 data = b''.join(
     compact_word(*w) for w in advent['words']
 ) + bytes(3)
-print(f"compact words {len(data)} bytes")
-n += len(data)
+
+print(f"ADVDAT ${len(bin):04x} + constant VOCAB   \\ {len(data)} bytes")
+bin += data
 
 # caves
-data = b''.join(
-    compact_cave(sqz(c['long']), sqz(c['short']), c['travel']) for c in advent['caves']
-)
-print(f"compact cave data {len(data)} bytes plus {len(advent['caves'])*2} byte index")
-n += len(data)
+zs = [compact_cave(sqz(c['long']), sqz(c['short']), c['travel']) for c in advent['caves']]
+idx = pack_index(zs)
+data = b''.join(zs)
+print(f"ADVDAT ${len(bin):04x} + constant CAVES&  \\ {len(idx)} bytes")
+bin += idx
+print(f"ADVDAT ${len(bin):04x} + constant CAVES   \\ {len(data)} bytes")
+bin += data
 
 # messages
 zs = [sqz(msg) for msg in advent['messages']]
-offsets = list(accumulate((len(z) for z in zs), initial=0))[:-1]
-assert len(offsets) == len(zs)
+idx = pack_index(zs)
 data = b''.join(zs)
-print(f"compact message data {len(data)} byte plus {len(offsets)*2} byte index")
-n += len(data)
+print(f"ADVDAT ${len(bin):04x} + constant MSGS&   \\ {len(idx)} bytes")
+bin += idx
+print(f"ADVDAT ${len(bin):04x} + constant MSGS    \\ {len(data)} bytes")
+bin += data
 
 # items
 zs = [b''.join(sqz(s) for s in states) for states in advent['items']]
-offsets = list(accumulate((len(z) for z in zs), initial=0))[:-1]
-assert len(offsets) == len(zs)
+idx = pack_index(zs)
 data = b''.join(zs)
-print(f"compact item data {len(data)} byte plus {len(offsets)*2} byte index")
-n += len(data)
+print(f"ADVDAT ${len(bin):04x} + constant ITEMS&  \\ {len(idx)} bytes")
+bin += idx
+print(f"ADVDAT ${len(bin):04x} + constant ITEMS   \\ {len(data)} bytes")
+bin += data
 
-print(f"total {n} bytes")
+print(f"longest string {max_sqz[1]}, compressed {max_sqz[0]-max_sqz[1]}")
+open('data/advent.dat', 'wb').write(bin)
+print(f"Wrote {len(bin)} bytes to advent.dat")

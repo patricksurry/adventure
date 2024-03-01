@@ -14,14 +14,65 @@ This lets us find string terminators without decompressing.
 """
 
 from collections import Counter
+import re
 
 
-def dizzy(s: bytes) -> (bytes, dict[int, bytes]):
+def unwrap(s: str) -> str:
+    """Replace wrapping newlines with a single space (not reversible)"""
+    s = re.sub(r' *\n(?=\n*)', ' ', s)
+    # also replace double space after period
+    s = re.sub(r'\.  (?=[A-Z])', '. ', s)
+    return s
+
+
+def _rle(m):
+    s = m.group()
+    return chr(len(s)) + s[0]
+
+
+def _unrle(m):
+    s = m.group()
+    return s[1] * ord(s[0])
+
+
+def woozy(s: str) -> bytes:
+    """Prepare a mostly lowercase ascii string for better dizzy compression"""
+    # only allow cr, lf, tab and nul
+    assert not {c for c in s if ord(c) < 32 and ord(c) not in {0, 0x9, 0xa, 0xd}}
+    # we use the following escapes:
+    # 3-8 => repeat next chr N times
+    # 0xb, 0xc => one cap/all cap
+    # 0x1, 0x2, 0x0e...0x1f: unused
+
+    # encode runs of 3-10 chars
+    s = re.sub(r'(.)\1{2,7}', _rle, s)
+    # encode all-caps words, e.g. 'not MY fault' => 'not <CAPS>my fault'
+    s = re.sub(r'\b[A-Z][A-Z]+\b', lambda m: '\x0c' + m.group().lower(), s)
+    # get rid of any remaining caps, e.g. 'I love PariS' => '<CAP>i love <CAP>pari<CAP>s'
+    s = re.sub(r'[A-Z]', lambda m: '\x0b' + m.group().lower(), s)
+    # fold spaces into following letter, e.g 'the <CAP>king and <CAP>i' => 'the<CAP>KingAnd<CAP>I'
+    s = re.sub(r' [\x0b\x0c]?[a-z]', lambda m: m.group()[1:].upper(), s)
+
+    return s.encode('ascii')
+
+
+def unwoozy(data: bytes) -> str:
+    """reverse the pre-compression"""
+    s = data.decode('ascii')
+
+    s = re.sub(r'[\x0b\x0c]?[A-Z]', lambda m: ' ' + m.group().lower(), s)
+    s = re.sub(r'[\x0b][a-z]', lambda m: m.group()[1:].upper(), s)
+    s = re.sub(r'[\x0c][a-z]+', lambda m: m.group()[1:].upper(), s)
+    s = re.sub(r'[\x03-\x08].', _unrle, s)
+    return s
+
+
+def dizzy(s: bytes) -> tuple[bytes, dict[int, bytes]]:
     """Compute a lookup table while compressing the source string"""
     assert all(x < 128 for x in s), "Input must be 7-bit bytes"
 
     k = 128
-    digrams: dict(int, bytes) = {}
+    digrams: dict[int, bytes] = {}
     while k < 256:
         pairs = [s[i:i+2] for i in range(0, len(s), 2)]
         pairs = [p for p in pairs if len(p) == 2 and 0 not in p]    # avoid zero
@@ -46,7 +97,7 @@ def dizzy_squeeze(s: bytes, digrams: dict[int, bytes]) -> bytes:
 
 
 def undizzy(s: bytes, digrams: dict[int, bytes]) -> bytes:
-    """Decode a string using on a lookup table"""
+    """Decode a string using a lookup table"""
     while True:
         k = next((x for x in s if x & 0x80), 0)
         if not k:
@@ -72,7 +123,8 @@ def undizzy_stack(s: bytes, digrams: dict[int, bytes]) -> bytes:
             else:
                 x,y = digrams[x]
                 stack.append(y)
-                if len(stack) > maxdepth: maxdepth = len(stack)
+                if len(stack) > maxdepth:
+                    maxdepth = len(stack)
     print(f"undizzy_stack: max stack depth {maxdepth}")
     return out
 
@@ -136,18 +188,32 @@ if __name__ == "__main__":
 
         sed '1s/^\xEF\xBB\xBF//' < alice.txt > tmp
         iconv -f utf-8 -t ascii//TRANSLIT tmp > alice.asc
-    """
-    alice = open('alice.asc').read().encode('ascii')
 
-    data, lookup = dizzy(alice)
+        s = re.sub(r'[\x14-\x1f]','~',s)
+    """
+    alice = open('alice.asc').read()
+
+    data, lookup = dizzy(alice.encode('ascii'))
+    open('alice.dzy', 'wb').write(b''.join(lookup.values()) + data)
     ratio = 1. * len(alice) / len(data)
     print(f"Compressed {len(alice)} bytes to {len(data)} bytes: ratio {ratio:.1f}x")
 
-    recover = undizzy(data, lookup)
-    print("undizzy ok?", recover == alice)
+    check = undizzy(data, lookup).decode('ascii')
+    print("undizzy ok?", check == alice)
 
-    recover = undizzy_stack(data, lookup)
+    recover = undizzy_stack(data, lookup).decode('ascii')
     print("undizzy_stack ok?", recover == alice)
 
-    altdata = dizzy_squeeze(alice, lookup)
-    print("dizzy_encode ok?", altdata == data)
+    altdata = dizzy_squeeze(alice.encode('ascii'), lookup)
+    print("dizzy_squeeze ok?", altdata == data)
+
+
+    s = unwrap(alice)
+    print(f"Unwrap from {len(alice)} -> {len(s)}")
+
+    ws = woozy(s)
+    print('woozy roundtrip?', unwoozy(ws) == s)
+    open('alice.wzy', 'wb').write(ws)
+    data, lookup = dizzy(ws)
+    check = unwoozy(undizzy(data, lookup))
+    print(f"dizzy+woozy to {len(data)}, roundtrip ok? {check == s}")
